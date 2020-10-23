@@ -4,13 +4,56 @@ import os
 import gym
 import numpy
 import torch
+import cv2
 
 from .abstract_game import AbstractGame
 
-try:
-    import cv2
-except ModuleNotFoundError:
-    raise ModuleNotFoundError('Please run "pip install gym[atari]"')
+import retro
+import os
+from baselines.common.retro_wrappers import TimeLimit, wrap_deepmind_retro
+
+from baselines.common.vec_env import SubprocVecEnv
+from baselines.common.vec_env.vec_video_recorder import VecVideoRecorder
+from gym.wrappers.monitor import Monitor
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def make_retro(*, game, state=None, max_episode_steps=4500, **kwargs):
+    import retro
+    if state is None:
+        state = retro.State.DEFAULT
+    env = retro.make(game, state, **kwargs)
+    # env = StochasticFrameSkip(env, n=4, stickprob=0.25)
+    if max_episode_steps is not None:
+        env = TimeLimit(env, max_episode_steps=max_episode_steps)
+    return env
+
+
+def make_sf2_env():
+  retro.data.Integrations.add_custom_path(
+    os.path.join(SCRIPT_DIR, "../../sf2/custom_integrations")
+  )
+  env = make_retro(
+    game='SuperStreetFighter2-Snes',
+    state=retro.State.DEFAULT,
+    scenario=None,
+    inttype=retro.data.Integrations.CUSTOM_ONLY,
+    obs_type=retro.Observations.IMAGE,  # obs_type=retro.Observations.RAM,
+    players=1,  # players=2
+  )
+  env = wrap_deepmind_retro(
+    env,
+    # frame_stack=64
+  )
+  return env
+
+
+def make_sf2_env_with_video_recording():
+    video_path = './recording'
+    env = Monitor(make_sf2_env(), video_path)
+    return env
 
 
 class MuZeroConfig:
@@ -23,10 +66,10 @@ class MuZeroConfig:
 
 
         ### Game
-        self.observation_shape = (3, 96, 96)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
-        self.action_space = list(range(4))  # Fixed list of all possible actions. You should only edit the length
+        self.observation_shape = (4, 96, 96)  # Dimensions of the game observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
+        self.action_space = list(range(468))  # Fixed list of all possible actions. You should only edit the length  # TODO: Get from environment (see Game.legal_actions)
         self.players = list(range(1))  # List of players. You should only edit the length
-        self.stacked_observations = 32  # Number of previous observations and previous actions to add to the current observation
+        self.stacked_observations = 10 * 30  # 10 * 30  # Number of previous observations and previous actions to add to the current observation
 
         # Evaluate
         self.muzero_player = 0  # Turn Muzero begins to play (0: MuZero plays first, 1: MuZero plays second)
@@ -35,10 +78,10 @@ class MuZeroConfig:
 
 
         ### Self-Play
-        self.num_workers = 350  # Number of simultaneous threads/workers self-playing to feed the replay buffer
+        self.num_workers = 32 - 5  # Number of simultaneous threads/workers self-playing to feed the replay buffer
         self.selfplay_on_gpu = False
-        self.max_moves = 27000  # Maximum number of moves if game is not finished before
-        self.num_simulations = 50  # Number of future moves self-simulated
+        self.max_moves = 99 * 30  # Maximum number of moves if game is not finished before
+        self.num_simulations = 1  # Number of future moves self-simulated
         self.discount = 0.997  # Chronological discount of the reward
         self.temperature_threshold = None  # Number of moves before dropping the temperature given by visit_softmax_temperature_fn to 0 (ie selecting the best action). If None, visit_softmax_temperature_fn is used every time
 
@@ -98,9 +141,9 @@ class MuZeroConfig:
 
 
         ### Replay Buffer
-        self.replay_buffer_size = int(1e6)  # Number of self-play games to keep in the replay buffer
+        self.replay_buffer_size = int(20)  # Number of self-play games to keep in the replay buffer
         self.num_unroll_steps = 5  # Number of game moves to keep for every batch element
-        self.td_steps = 10  # Number of steps in the future to take into account for calculating the target value
+        self.td_steps = 1  # Number of steps in the future to take into account for calculating the target value
         self.PER = True  # Prioritized Replay (See paper appendix Training), select in priority the elements in the replay buffer which are unexpected for the network
         self.PER_alpha = 1  # How much prioritization is used, 0 corresponding to the uniform case, paper suggests 1
 
@@ -138,7 +181,13 @@ class Game(AbstractGame):
     """
 
     def __init__(self, seed=None):
-        self.env = gym.make("Breakout-v4")
+        self.env = make_sf2_env()  # make_sf2_env_with_video_recording()
+        self.actions = []
+        for action in range(2 ** self.env.num_buttons + 1):
+            filtered_action = self.env.data.filter_action(action)
+            if action == filtered_action:
+                self.actions.append(action)
+        self._legal_actions = list(range(len(self.actions)))
         if seed is not None:
             self.env.seed(seed)
 
@@ -152,11 +201,20 @@ class Game(AbstractGame):
         Returns:
             The new observation, the reward and a boolean if the game has ended.
         """
-        observation, reward, done, _ = self.env.step(action)
+        action_bitmap = self.actions[action]
+        action_list = self._action_bitmap_to_action_list(action_bitmap)
+        observation, reward, done, _ = self.env.step(action_list)
         observation = cv2.resize(observation, (96, 96), interpolation=cv2.INTER_AREA)
         observation = numpy.asarray(observation, dtype="float32") / 255.0
         observation = numpy.moveaxis(observation, -1, 0)
+        self.env.render()
         return observation, reward, done
+
+    def _action_bitmap_to_action_list(self, action_bitmap):
+        action_list = [0] * self.env.num_buttons
+        for index in range(self.env.num_buttons):
+            action_list[index] = (action_bitmap >> index) & 1
+        return action_list
 
     def legal_actions(self):
         """
@@ -169,7 +227,7 @@ class Game(AbstractGame):
         Returns:
             An array of integers, subset of the action space.
         """
-        return list(range(4))
+        return self._legal_actions
 
     def reset(self):
         """
@@ -194,5 +252,4 @@ class Game(AbstractGame):
         """
         Display the game observation.
         """
-        self.env.render()
-        input("Press enter to take a step ")
+        # self.env.render()
